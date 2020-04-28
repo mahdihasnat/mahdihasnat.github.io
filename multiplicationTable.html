@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <script>
+        function generateTable() {
+            var space = document.getElementById("tableSpace");
+            var tableCode = "";
+            var n = document.getElementById("limit").value;
+            if (n == "" || n == 0) {
+                n = 5;
+                document.getElementById("limit").value = n;
+            }
+            tableCode = "<table border = \"1\" >";
+            tableCode += "<tr>";
+            tableCode += "<td> </td>"
+            for (i = 1; i <= n; i++)
+                tableCode += "<td> " + i + "</td>";
+            tableCode += "</tr>";
+            for (i = 1; i <= n; i++) {
+                tableCode += "<tr>";
+                tableCode += "<td>" + i + "</td>";
+                for (j = 1; j <= n; j++)
+                    tableCode += "<td>" + i * j + "</td>";
+                tableCode += "</tr>";
+            }
+            tableCode += "</table>";
+            space.innerHTML = tableCode;
+        }
+    </script>
+</head>
+
+<body>
+    <input type="number" id="limit" />
+    <button onclick="generateTable()">
+        Generate Myltiplication Table
+    </button>
+    <br>
+    <span id="tableSpace"></span>
+</body>
+
+</html>

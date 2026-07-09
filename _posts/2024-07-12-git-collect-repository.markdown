@@ -20,3 +20,293 @@ But I want to preserve linear history (with the cost of destroying commit hash a
 I don't yet know how to do that. But I will update this post when I find a way to do that.
 
 Stay tuned!
+
+## Update (2026-07-09): the solution
+
+Finally got around to actually doing this, combining all 7 of my BUET CSE undergrad term
+repos into one: [buet-cse-undergrad](https://github.com/mahdihasnat/buet-cse-undergrad).
+
+Turns out `git subtree`'s merge-commit approach and a fully linear (flattened/cherry-picked)
+history were both the wrong framing. The real unlock: each repo's commit history occupies its
+own non-overlapping time window (Level 1 Term 1 in late 2018, Level 2 Term 1 in 2019, and so
+on). Given that, you don't have to choose between "one linear history" and "preserve every
+repo's real branch/merge structure" — you can have both, by replaying every commit from every
+repo in one global chronological order (a plain k-way merge by timestamp, using each repo's own
+topological order so nothing ever gets replayed before its parent), and only creating a real
+two-parent `git merge` in the combined repo at the exact moment a repo's own history actually
+had one. Regular commits get cherry-picked onto whichever line (main, or a temporary per-repo
+fork branch) they continue; a repo's own merge commit closes out that fork with a real merge,
+using the original merge's tree as ground truth so it's reproduced exactly.
+
+One nice side effect of doing it this way: a couple of stray late-dated commits in one of my
+repos (an old Dependabot bump and a leftover zip extraction, dated well after that term ended)
+just landed in their own correct chronological slot automatically — no manual cutoff needed,
+unlike a whole-branch-merge approach would have required.
+
+Commit hashes and GitHub-verified badges don't survive (paths change since every repo's tree
+gets rewritten into its own subdirectory, which changes every hash), but authors, dates,
+messages, and full internal branch/merge topology are all preserved exactly.
+
+Here's the script ([also on GitHub](https://github.com/mahdihasnat/buet-cse-undergrad)):
+
+```python
+{% raw %}
+#!/usr/bin/env python3
+"""
+Combine multiple independent git repos into one, each living under its own
+subdirectory, while replaying every commit from every repo in one global
+chronological order and preserving each repo's real branch/merge structure.
+
+For each sub-repo we track two things as we go:
+  - CURRENT[subdir]: the original commit (in that repo's own history) that
+    `main` currently reflects for that subdirectory.
+  - an open fork branch (side_branch/side_tip), if that repo's history has
+    diverged and not yet been merged back.
+
+A regular commit continuing CURRENT[subdir] is cherry-picked straight onto
+`main`. A regular commit continuing an open fork is cherry-picked onto that
+fork's branch. A commit that is a real merge in the original repo (its two
+parents being exactly CURRENT[subdir] and the fork tip) is replayed as a
+real `git merge` in the super-repo at that same chronological point, with
+the result forced to match the original merge's tree exactly.
+
+This needs no manual "where does this repo's usable history end" cutoff:
+every commit, including any oddly-dated outliers, is placed by the merge
+order below at its own correct chronological position.
+
+Reusable for a different repo list: only REPOS at the top needs to change.
+"""
+import heapq
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+WORK_DIR = Path.home() / "Desktop/works"
+BUILD_DIR = WORK_DIR / "_buet-cse-undergrad-build"
+SUPER_REPO = WORK_DIR / "buet-cse-undergrad"
+
+# --- Config: repo directory name (under WORK_DIR) -> target subdirectory ---
+REPOS = [
+    ("Level--1-Term--1", "level-1-term-1"),
+    ("2-1-kodes", "level-2-term-1"),
+    ("2-2-Nodes", "level-2-term-2"),
+    ("3-1-Codes", "level-3-term-1"),
+    ("3-2-Modes", "level-3-term-2"),
+    ("4-1-Lodes", "level-4-term-1"),
+    ("4-2-Qodes", "level-4-term-2"),
+]
+# ---------------------------------------------------------------------------
+
+
+def run(cmd, cwd=None, check=True, capture=False, env=None):
+    result = subprocess.run(
+        cmd, cwd=str(cwd) if cwd else None, text=True,
+        capture_output=capture, env=env,
+    )
+    if check and result.returncode != 0:
+        raise RuntimeError(
+            f"Command failed ({result.returncode}): {' '.join(cmd)}\n"
+            f"cwd={cwd}\nstdout={result.stdout}\nstderr={result.stderr}"
+        )
+    return result
+
+
+def require_filter_repo():
+    if shutil.which("git-filter-repo") is None:
+        try:
+            run(["git", "filter-repo", "--version"], capture=True)
+        except Exception:
+            print("git-filter-repo is required but not installed.", file=sys.stderr)
+            sys.exit(1)
+
+
+def rewrite_repos():
+    if BUILD_DIR.exists():
+        shutil.rmtree(BUILD_DIR)
+    BUILD_DIR.mkdir(parents=True)
+    for repo, subdir in REPOS:
+        print(f"==> Rewriting {repo} -> {subdir}/ (full history/merges preserved)")
+        dest = BUILD_DIR / repo
+        run(["git", "clone", "--quiet", str(WORK_DIR / repo), str(dest)])
+        run(["git", "filter-repo", "--to-subdirectory-filter", subdir], cwd=dest)
+
+
+def init_super_repo():
+    if SUPER_REPO.exists():
+        shutil.rmtree(SUPER_REPO)
+    SUPER_REPO.mkdir(parents=True)
+    run(["git", "init", "--quiet"], cwd=SUPER_REPO)
+    run(["git", "checkout", "--quiet", "-b", "main"], cwd=SUPER_REPO)
+    run(["git", "commit", "--allow-empty", "--quiet", "-m", "Initial empty commit"], cwd=SUPER_REPO)
+    for repo, subdir in REPOS:
+        run(["git", "remote", "add", subdir, str(BUILD_DIR / repo)], cwd=SUPER_REPO)
+        run(["git", "fetch", "--quiet", subdir], cwd=SUPER_REPO)
+
+
+def default_branch(subdir):
+    out = run(["git", "symbolic-ref", "--short", f"refs/remotes/{subdir}/HEAD"],
+               cwd=SUPER_REPO, capture=True, check=False).stdout.strip()
+    if out:
+        return out.rsplit("/", 1)[-1]
+    return "master"
+
+
+def per_subdir_history(subdir):
+    branch = default_branch(subdir)
+    ref = f"refs/remotes/{subdir}/{branch}"
+    out = run(
+        ["git", "log", ref, "--topo-order", "--reverse", "--format=%at|%H|%P"],
+        cwd=SUPER_REPO, capture=True,
+    ).stdout
+    entries = []
+    for line in out.splitlines():
+        ts, sha, parents = line.split("|", 2)
+        entries.append((int(ts), sha, parents.split() if parents else []))
+    return entries
+
+
+def build_global_order():
+    heap = []
+    iters = {}
+    for repo, subdir in REPOS:
+        lst = per_subdir_history(subdir)
+        print(f"    {subdir}: {len(lst)} commits")
+        it = iter(lst)
+        iters[subdir] = it
+        try:
+            ts, sha, parents = next(it)
+            heapq.heappush(heap, (ts, subdir, sha, parents))
+        except StopIteration:
+            pass
+    order = []
+    while heap:
+        ts, subdir, sha, parents = heapq.heappop(heap)
+        order.append((ts, sha, parents, subdir))
+        try:
+            ts2, sha2, parents2 = next(iters[subdir])
+            heapq.heappush(heap, (ts2, subdir, sha2, parents2))
+        except StopIteration:
+            pass
+    return order
+
+
+def checkout(ref):
+    run(["git", "checkout", "--quiet", ref], cwd=SUPER_REPO)
+
+
+def rev_parse_head():
+    return run(["git", "rev-parse", "HEAD"], cwd=SUPER_REPO, capture=True).stdout.strip()
+
+
+def fix_committer_date(sha_note):
+    adate = run(["git", "show", "-s", "--format=%aI", "HEAD"], cwd=SUPER_REPO, capture=True).stdout.strip()
+    env = {**os.environ, "GIT_COMMITTER_DATE": adate}
+    run(["git", "commit", "--amend", "--no-edit", "--allow-empty", "--quiet"], cwd=SUPER_REPO, env=env)
+
+
+def cherry_pick(sha):
+    run(["git", "cherry-pick", "--allow-empty", "--keep-redundant-commits", sha], cwd=SUPER_REPO)
+    fix_committer_date(sha)
+    return rev_parse_head()
+
+
+def commit_message(sha):
+    return run(["git", "log", "-1", "--format=%B", sha], cwd=SUPER_REPO, capture=True).stdout
+
+
+def do_merge(sha, subdir, fork_branch):
+    checkout("main")
+    run(["git", "merge", "--no-commit", "--no-ff", fork_branch], cwd=SUPER_REPO, check=False)
+    # Force the result to match the original merge's tree for this subdir
+    # exactly, regardless of how the automatic merge attempt went.
+    run(["git", "checkout", sha, "--", subdir], cwd=SUPER_REPO)
+    run(["git", "add", subdir], cwd=SUPER_REPO)
+    msg = commit_message(sha)
+    proc = subprocess.run(["git", "commit", "--quiet", "-F", "-"], cwd=SUPER_REPO, input=msg, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"git commit failed for merge {sha} in {subdir}")
+    fix_committer_date(sha)
+    return rev_parse_head()
+
+
+def replay(order):
+    current = {}
+    side_tip = {}
+    side_branch = {}
+    obj_map = {}
+
+    total = len(order)
+    for i, (ts, sha, parents, subdir) in enumerate(order, 1):
+        if len(parents) == 0:
+            checkout("main")
+            new_hash = cherry_pick(sha)
+            obj_map[sha] = new_hash
+            current[subdir] = sha
+
+        elif len(parents) == 1:
+            p = parents[0]
+            if current.get(subdir) == p:
+                checkout("main")
+                new_hash = cherry_pick(sha)
+                obj_map[sha] = new_hash
+                current[subdir] = sha
+            elif side_tip.get(subdir) == p:
+                checkout(side_branch[subdir])
+                new_hash = cherry_pick(sha)
+                obj_map[sha] = new_hash
+                side_tip[subdir] = sha
+            else:
+                if p not in obj_map:
+                    raise RuntimeError(f"parent {p} of {sha} ({subdir}) not processed yet")
+                branch = f"fork/{subdir}"
+                run(["git", "branch", "-f", branch, obj_map[p]], cwd=SUPER_REPO)
+                side_branch[subdir] = branch
+                checkout(branch)
+                new_hash = cherry_pick(sha)
+                obj_map[sha] = new_hash
+                side_tip[subdir] = sha
+
+        elif len(parents) == 2:
+            p1, p2 = parents
+            cur = current.get(subdir)
+            tip = side_tip.get(subdir)
+            if {p1, p2} != {cur, tip} or cur == tip:
+                raise RuntimeError(
+                    f"unexpected merge topology for {sha} ({subdir}): "
+                    f"parents={parents} current={cur} side_tip={tip}"
+                )
+            new_hash = do_merge(sha, subdir, side_branch[subdir])
+            obj_map[sha] = new_hash
+            current[subdir] = sha
+            run(["git", "branch", "-D", side_branch[subdir]], cwd=SUPER_REPO, check=False)
+            del side_tip[subdir]
+            del side_branch[subdir]
+
+        else:
+            raise RuntimeError(f"octopus merge not supported: {sha} ({subdir})")
+
+        if i % 50 == 0 or i == total:
+            print(f"  ...{i}/{total} replayed")
+
+    checkout("main")
+
+
+def main():
+    require_filter_repo()
+    rewrite_repos()
+    init_super_repo()
+    print("==> Computing global chronological commit order")
+    order = build_global_order()
+    print(f"Total commits to replay: {len(order)}")
+    replay(order)
+    print()
+    print(f"Done. Combined repo with preserved branch/merge structure at {SUPER_REPO}")
+    run(["git", "log", "--graph", "--oneline", "--all"], cwd=SUPER_REPO, check=False)
+
+
+if __name__ == "__main__":
+    main()
+{% endraw %}
+```
